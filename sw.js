@@ -1,7 +1,7 @@
 /* Finance_Care — service worker : garde l'application sur le téléphone pour l'ouvrir hors ligne.
  * Ne touche jamais aux échanges avec Microsoft/OneDrive (autres domaines) : ils passent toujours par le réseau. */
-const VERSION = 'fc-mobile-1';
-const SHELL = ['./', 'index.html', 'styles.css', 'mobile.css', 'config.js', 'csvformat.js', 'onedrive.js', 'calc.js', 'app.js',
+const VERSION = 'fc-mobile-2';
+const SHELL = ['./', 'index.html', 'styles.css', 'mobile.css', 'config.js', 'csvformat.js', 'sync.js', 'calc.js', 'app.js',
   'manifest.webmanifest', 'icons/icon-192.png', 'icons/icon-512.png', 'icons/icon-maskable-512.png'];
 
 self.addEventListener('install', (e) => {

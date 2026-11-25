@@ -10,8 +10,9 @@ let reloads = [];
 global.location = { href: 'https://exemple.github.io/finance-care/', reload: () => reloads.push(1), replace() {}, assign() {} };
 Object.defineProperty(global, 'navigator', { value: { onLine: true }, configurable: true });
 global.FCCSV = require('../csvformat.js');
-require('../onedrive.js');
-const { Backend, Graph } = global.FC_ONEDRIVE;
+require('../sync.js');
+const { Backend, Graph } = global.FC_SYNC;
+const realDropbox = { ...global.FC_SYNC.Dropbox }; // copie avant simulation
 const CSV = global.FCCSV;
 
 /* ---- OneDrive simulé ---- */
@@ -122,7 +123,7 @@ test('même fichier modifié des deux côtés : conflit, rien n\'est écrasé, p
   assert.strictEqual(Backend.status, 'conflict');
   assert.match(drive['utilisateurs/sam/depenses.csv'].text, /Achat PC/);
   assert.doesNotMatch(drive['utilisateurs/sam/depenses.csv'].text, /Achat tel/);
-  await Backend.resolve('onedrive');
+  await Backend.resolve('cloud');
   assert.ok(Backend.cache.fc_data_sam.expenses.some((e) => e.label === 'Achat PC'));
   assert.ok(!Backend.cache.fc_data_sam.expenses.some((e) => e.label === 'Achat tel'));
   assert.deepStrictEqual(Backend.state.conflicts, {});
@@ -149,4 +150,36 @@ test('premier lancement sans fichiers sur OneDrive : compte créé sur le télé
   await Backend.syncAll({});
   assert.ok(drive['comptes.csv']);
   assert.deepStrictEqual(Object.keys(drive).filter((p) => p.startsWith('utilisateurs/sam/')).map((p) => p.split('/').pop()).sort(), CSV.USER_FILES.slice().sort());
+});
+
+test('Dropbox : appels API (liste, téléchargement, envoi, conflit)', async () => {
+  const calls = [];
+  localStorage.setItem('fcod_auth', JSON.stringify({ access_token: 'tok', expires_at: Date.now() + 3600e3, refresh_token: 'r' }));
+  global.fetch = async (url, opt = {}) => {
+    calls.push({ url, opt });
+    const arg = opt.headers && opt.headers['Dropbox-API-Arg'] ? JSON.parse(opt.headers['Dropbox-API-Arg']) : null;
+    if (url.endsWith('/files/list_folder')) {
+      const body = JSON.parse(opt.body);
+      if (body.path === '/utilisateurs/inconnu') return new Response('{"error_summary":"path/not_found/"}', { status: 409 });
+      return new Response(JSON.stringify({ entries: [{ '.tag': 'file', name: 'comptes.csv', rev: 'a1', path_lower: '/comptes.csv' }, { '.tag': 'folder', name: 'utilisateurs' }], has_more: false }), { status: 200 });
+    }
+    if (url.endsWith('/files/download')) return new Response('﻿utilisateur;sel;empreinte;cree_le\r\n', { status: 200 });
+    if (url.endsWith('/files/upload')) {
+      if (arg.mode['.tag'] === 'update' && arg.mode.update !== 'a1') return new Response('{"error_summary":"path/conflict/file/"}', { status: 409 });
+      return new Response(JSON.stringify({ rev: 'a2' }), { status: 200 });
+    }
+    return new Response('', { status: 404 });
+  };
+  const Store = realDropbox;
+  assert.deepStrictEqual(await Store.list('utilisateurs/inconnu'), {});
+  const l = await Store.list('');
+  assert.deepStrictEqual(Object.keys(l), ['comptes.csv']);
+  assert.strictEqual(await Store.download(l['comptes.csv']), 'utilisateur;sel;empreinte;cree_le\r\n');
+  assert.deepStrictEqual(await Store.upload('comptes.csv', 'x', 'a1'), { etag: 'a2' });
+  assert.deepStrictEqual(await Store.upload('comptes.csv', 'x', 'vieux'), { conflict: true });
+  assert.deepStrictEqual(await Store.upload('utilisateurs/élodie/profil.csv', 'x', null), { etag: 'a2' });
+  const last = calls[calls.length - 1];
+  assert.match(last.opt.headers['Dropbox-API-Arg'], /\\u00e9lodie/, 'en-tête ASCII uniquement');
+  assert.strictEqual(JSON.parse(last.opt.headers['Dropbox-API-Arg']).mode['.tag'], 'overwrite');
+  assert.strictEqual(last.opt.headers.Authorization, 'Bearer tok');
 });
