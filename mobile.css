@@ -1,0 +1,15 @@
+/* Finance_Care mobile — compléments pour téléphone */
+body { padding-bottom: calc(3.2rem + env(safe-area-inset-bottom)); -webkit-tap-highlight-color: transparent; }
+input, select, textarea { font-size: 16px; } /* évite le zoom automatique d'Android/iOS */
+.sync-pill { position: fixed; right: .7rem; bottom: calc(.7rem + env(safe-area-inset-bottom)); z-index: 50; border-radius: 999px;
+  border: 1px solid #d6d9de; background: #fff; padding: .4rem .75rem; font: inherit; font-size: .82rem; box-shadow: 0 2px 8px rgba(0,0,0,.12); cursor: pointer; }
+.sync-pill.good { color: var(--good-ink); }
+.sync-pill.warning { color: var(--warning-ink); border-color: var(--warning); }
+.sync-pill.critical { color: #fff; background: var(--critical); border-color: transparent; }
+.sync-pill.muted { color: var(--ink-2); }
+.sync-panel { position: fixed; inset: 0; z-index: 60; background: rgba(0,0,0,.4); display: flex; align-items: flex-end; justify-content: center; }
+.sync-card { background: #fff; width: 100%; max-width: 520px; border-radius: 14px 14px 0 0; padding: 1.1rem 1.1rem calc(1rem + env(safe-area-inset-bottom));
+  display: flex; flex-direction: column; gap: .55rem; }
+.sync-card h3 { margin: 0; }
+.sync-card p { margin: 0; }
+@media (min-width: 700px) { .sync-panel { align-items: center; } .sync-card { border-radius: 14px; } }
