@@ -14,6 +14,17 @@ et enregistre les **mêmes fichiers CSV** dans votre Dropbox (OneDrive reste pos
 - Dans ce dossier : `comptes.csv` et `utilisateurs/<nom>/*.csv`, exactement comme le dossier `donnees/` du PC
   (vérifié par les tests : fichiers identiques octet pour octet).
 
+## Nouveautés (version 2)
+
+- **Plusieurs comptes bancaires** (courant, livret, compte joint…) : page « Comptes bancaires », et en haut des pages
+  un sélecteur pour afficher un, deux, trois comptes ou tous. Fichier `comptes_bancaires.csv` + colonne `compte_id`
+  dans `revenus.csv`, `depenses.csv`, `recurrentes.csv`. Les anciens fichiers sont relus sans rien perdre :
+  tout ce qui n'a pas de compte va dans le « Compte principal ».
+- **Mon compte** : prénom, devise, salaire (et compte de versement), nom d'utilisateur, mot de passe.
+- **Suppression du compte** (nom d'utilisateur + mot de passe demandés) : efface l'identifiant et le dossier
+  `utilisateurs/<nom>/` (Dropbox garde les fichiers supprimés environ 30 jours).
+- **Téléphone** : barre d'onglets en bas, bouton « + », listes au lieu de tableaux, fenêtres qui montent du bas.
+
 ## Synchronisation
 
 - Chaque modification est gardée tout de suite sur le téléphone, puis envoyée sur Dropbox

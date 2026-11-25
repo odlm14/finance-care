@@ -46,13 +46,18 @@
   const T = {
     profil: ['cle', 'valeur'],
     categories: ['id', 'nom', 'couleur'],
-    revenus: ['id', 'date', 'montant', 'type', 'libelle'],
-    depenses: ['id', 'date', 'montant', 'categorie_id', 'type', 'libelle', 'recurrente_id'],
-    recurrentes: ['id', 'libelle', 'montant', 'categorie_id', 'jour', 'debut', 'fin', 'active', 'mois_ignores'],
+    revenus: ['id', 'date', 'montant', 'type', 'libelle', 'compte_id'],
+    depenses: ['id', 'date', 'montant', 'categorie_id', 'type', 'libelle', 'recurrente_id', 'compte_id'],
+    recurrentes: ['id', 'libelle', 'montant', 'categorie_id', 'jour', 'debut', 'fin', 'active', 'mois_ignores', 'compte_id'],
     budgets: ['mois', 'categorie_id', 'montant'],
     objectifs: ['id', 'nom', 'type', 'montant_cible', 'date_limite', 'cree_le', 'pourcentage_salaire', 'archive'],
     versements: ['id', 'objectif_id', 'date', 'montant', 'note'],
+    comptes_bancaires: ['id', 'nom', 'type', 'couleur', 'solde_initial', 'archive'],
   };
+  /* Comptes bancaires (ajoutés en version 2). Les anciens fichiers n'ont ni comptes_bancaires.csv
+     ni colonne compte_id : tout est alors rattaché au « Compte principal » (migration douce). */
+  const DEFAULT_BANK = { id: 'principal', name: 'Compte principal', type: 'courant', color: '#1b64be', initialBalance: 0, archived: false };
+  const DATA_VERSION = 2;
   const USER_FILES = Object.keys(T).map((k) => k + '.csv');
   const ACCOUNTS_COLS = ['utilisateur', 'sel', 'empreinte', 'cree_le'];
 
@@ -76,12 +81,13 @@
     f['profil.csv'] = toCSV(T.profil, [
       { cle: 'nom', valeur: p.name }, { cle: 'devise', valeur: p.currency },
       { cle: 'salaire_montant', valeur: s.amount }, { cle: 'salaire_frequence', valeur: s.frequency }, { cle: 'salaire_jour', valeur: s.day },
-      { cle: 'configuration_terminee', valeur: yn(d.onboarded) }, { cle: 'version', valeur: d.version || 1 },
+      { cle: 'salaire_compte', valeur: s.accountId || '' },
+      { cle: 'configuration_terminee', valeur: yn(d.onboarded) }, { cle: 'version', valeur: Math.max(d.version || 1, DATA_VERSION) },
     ]);
     f['categories.csv'] = toCSV(T.categories, (d.categories || []).map((c) => ({ id: c.id, nom: c.name, couleur: c.color })));
-    f['revenus.csv'] = toCSV(T.revenus, (d.incomes || []).map((i) => ({ id: i.id, date: i.date, montant: i.amount, type: i.type, libelle: i.label })));
-    f['depenses.csv'] = toCSV(T.depenses, (d.expenses || []).map((e) => ({ id: e.id, date: e.date, montant: e.amount, categorie_id: e.categoryId, type: e.kind, libelle: e.label, recurrente_id: e.recurringId || '' })));
-    f['recurrentes.csv'] = toCSV(T.recurrentes, (d.recurring || []).map((r) => ({ id: r.id, libelle: r.label, montant: r.amount, categorie_id: r.categoryId, jour: r.day, debut: r.startMonth, fin: r.endMonth || '', active: yn(r.active), mois_ignores: (r.skipped || []).join('|') })));
+    f['revenus.csv'] = toCSV(T.revenus, (d.incomes || []).map((i) => ({ id: i.id, date: i.date, montant: i.amount, type: i.type, libelle: i.label, compte_id: i.accountId || '' })));
+    f['depenses.csv'] = toCSV(T.depenses, (d.expenses || []).map((e) => ({ id: e.id, date: e.date, montant: e.amount, categorie_id: e.categoryId, type: e.kind, libelle: e.label, recurrente_id: e.recurringId || '', compte_id: e.accountId || '' })));
+    f['recurrentes.csv'] = toCSV(T.recurrentes, (d.recurring || []).map((r) => ({ id: r.id, libelle: r.label, montant: r.amount, categorie_id: r.categoryId, jour: r.day, debut: r.startMonth, fin: r.endMonth || '', active: yn(r.active), mois_ignores: (r.skipped || []).join('|'), compte_id: r.accountId || '' })));
     const budgets = [];
     for (const [mois, bg] of Object.entries(d.budgets || {})) {
       budgets.push({ mois, categorie_id: '_global', montant: bg.global || 0 });
@@ -92,6 +98,7 @@
     const vers = [];
     for (const g of d.goals || []) for (const c of g.contributions || []) vers.push({ id: c.id, objectif_id: g.id, date: c.date, montant: c.amount, note: c.note || '' });
     f['versements.csv'] = toCSV(T.versements, vers);
+    f['comptes_bancaires.csv'] = toCSV(T.comptes_bancaires, (d.accounts || []).map((a) => ({ id: a.id, nom: a.name, type: a.type, couleur: a.color, solde_initial: a.initialBalance || 0, archive: yn(a.archived) })));
     return f;
   }
 
@@ -106,18 +113,23 @@
       if (r.categorie_id === '_global') bg.global = n(r.montant); else bg.categories[r.categorie_id] = n(r.montant);
     }
     const vers = rd('versements');
+    let accounts = rd('comptes_bancaires').filter((a) => a.id).map((a) => ({ id: a.id, name: a.nom || 'Compte', type: a.type || 'courant', color: a.couleur || '#1b64be', initialBalance: n(a.solde_initial), archived: b(a.archive) }));
+    if (!accounts.length) accounts = [{ ...DEFAULT_BANK }];
+    const ids = new Set(accounts.map((a) => a.id));
+    const acc = (v) => (v && ids.has(v) ? v : accounts[0].id);
     return {
-      version: n(kv.version) || 1,
+      version: Math.max(n(kv.version) || 1, DATA_VERSION),
       onboarded: b(kv.configuration_terminee),
-      profile: { name: kv.nom || '', currency: kv.devise || 'EUR', salary: { amount: n(kv.salaire_montant), frequency: kv.salaire_frequence || 'mensuel', day: n(kv.salaire_jour) || 1 } },
+      profile: { name: kv.nom || '', currency: kv.devise || 'EUR', salary: { amount: n(kv.salaire_montant), frequency: kv.salaire_frequence || 'mensuel', day: n(kv.salaire_jour) || 1, accountId: acc(kv.salaire_compte) } },
+      accounts,
       categories: rd('categories').map((c) => ({ id: c.id, name: c.nom, color: c.couleur || '#8d8d8d' })),
-      incomes: rd('revenus').map((i) => ({ id: i.id, date: i.date, amount: n(i.montant), type: i.type || 'supplementaire', label: i.libelle })),
+      incomes: rd('revenus').map((i) => ({ id: i.id, date: i.date, amount: n(i.montant), type: i.type || 'supplementaire', label: i.libelle, accountId: acc(i.compte_id) })),
       expenses: rd('depenses').map((e) => {
-        const o = { id: e.id, date: e.date, amount: n(e.montant), categoryId: e.categorie_id, kind: e.type === 'fixe' ? 'fixe' : 'variable', label: e.libelle };
+        const o = { id: e.id, date: e.date, amount: n(e.montant), categoryId: e.categorie_id, kind: e.type === 'fixe' ? 'fixe' : 'variable', label: e.libelle, accountId: acc(e.compte_id) };
         if (e.recurrente_id) o.recurringId = e.recurrente_id;
         return o;
       }),
-      recurring: rd('recurrentes').map((r) => ({ id: r.id, label: r.libelle, amount: n(r.montant), categoryId: r.categorie_id, day: n(r.jour) || 1, startMonth: r.debut, endMonth: r.fin || '', active: b(r.active), skipped: r.mois_ignores ? r.mois_ignores.split('|') : [] })),
+      recurring: rd('recurrentes').map((r) => ({ id: r.id, label: r.libelle, amount: n(r.montant), categoryId: r.categorie_id, day: n(r.jour) || 1, startMonth: r.debut, endMonth: r.fin || '', active: b(r.active), skipped: r.mois_ignores ? r.mois_ignores.split('|') : [], accountId: acc(r.compte_id) })),
       budgets,
       goals: rd('objectifs').map((g) => ({
         id: g.id, name: g.nom, type: g.type || 'autre', target: n(g.montant_cible), deadline: g.date_limite || '', createdAt: g.cree_le || '',
@@ -127,6 +139,6 @@
     };
   }
 
-  const FCCSV = { SEP, toCSV, parseCSV, T, USER_FILES, validUser, accountsToCSV, accountsFromCSV, dataToFiles, filesToData };
+  const FCCSV = { DEFAULT_BANK, DATA_VERSION, SEP, toCSV, parseCSV, T, USER_FILES, validUser, accountsToCSV, accountsFromCSV, dataToFiles, filesToData };
   if (typeof module !== 'undefined' && module.exports) module.exports = FCCSV; else root.FCCSV = FCCSV;
 })(typeof window !== 'undefined' ? window : globalThis);

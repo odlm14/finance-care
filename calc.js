@@ -71,6 +71,7 @@
         data.expenses.push({
           id: makeId(), date, amount: round2(r.amount), categoryId: r.categoryId,
           kind: 'fixe', label: r.label, recurringId: r.id,
+          ...(r.accountId ? { accountId: r.accountId } : {}),
         });
         added++;
       }
@@ -305,6 +306,31 @@
       savings: delta(A.savings, B.savings), balance: delta(A.balance, B.balance), categories: cats };
   }
 
+  /* ---------- Comptes bancaires ----------
+     Solde d'un compte = solde de départ + revenus − dépenses enregistrés jusqu'à aujourd'hui. */
+  function accountBalance(data, accountId, today) {
+    const a = (data.accounts || []).find((x) => x.id === accountId);
+    if (!a) return 0;
+    const upTo = (x) => x.accountId === accountId && (!today || x.date <= today);
+    return round2((Number(a.initialBalance) || 0) + sum((data.incomes || []).filter(upTo), (i) => i.amount) - sum((data.expenses || []).filter(upTo), (e) => e.amount));
+  }
+  /* Vue des données limitée à certains comptes (ids). Sans sélection (null ou vide) : toutes les données.
+     Le salaire prévu n'est compté que si son compte de versement fait partie de la sélection. */
+  function scopeData(data, ids) {
+    if (!ids || !ids.length) return data;
+    const set = new Set(ids);
+    const keep = (x) => set.has(x.accountId);
+    const salary = data.profile && data.profile.salary ? data.profile.salary : {};
+    const salaryIn = !salary.accountId || set.has(salary.accountId);
+    return {
+      ...data,
+      incomes: (data.incomes || []).filter(keep),
+      expenses: (data.expenses || []).filter(keep),
+      recurring: (data.recurring || []).filter(keep),
+      profile: salaryIn ? data.profile : { ...data.profile, salary: { ...salary, amount: 0 } },
+    };
+  }
+
   function fmtMoney(n, currency) {
     try { return new Intl.NumberFormat('fr-FR', { style: 'currency', currency: currency || 'EUR' }).format(round2(n)); }
     catch (e) { return round2(n).toFixed(2) + ' ' + (currency || ''); }
@@ -313,7 +339,7 @@
   const FC = {
     DEFAULT_CATEGORIES, PALETTE, FREQUENCIES, ALERT_WARN, round2, sum, toISODate, monthOf, addMonths, monthRange,
     daysInMonth, daysBetween, perMonth, monthlySalary, applyRecurring, pendingRecurring, budgetFor, statusFor,
-    goalSaved, goalStats, salaryAllocation, splitSalary, recommendedPercents, monthSummary, forecast, history,
+    goalSaved, goalStats, accountBalance, scopeData, salaryAllocation, splitSalary, recommendedPercents, monthSummary, forecast, history,
     compareMonths, fmtMoney,
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = FC; else root.FC = FC;

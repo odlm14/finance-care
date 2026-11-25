@@ -172,6 +172,12 @@
       if (!r.ok) throw new Error('Dropbox : enregistrement impossible (' + r.status + ')');
       return { etag: (await r.json()).rev };
     },
+    /* Supprime un dossier (et son contenu). Déjà absent : rien à faire. */
+    async remove(folder) {
+      const r = await authed('https://api.dropboxapi.com/2/files/delete_v2', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: '/' + folder }) });
+      if (r.status === 409) return; // introuvable
+      if (!r.ok) throw new Error('Dropbox : suppression impossible (' + r.status + ')');
+    },
   };
 
   /* --- OneDrive (Microsoft Graph) --- */
@@ -205,6 +211,11 @@
       if (!r.ok) throw new Error('OneDrive : enregistrement impossible (' + r.status + ')');
       return { etag: (await r.json()).eTag };
     },
+    async remove(folder) {
+      const r = await authed(P.graph + ':/' + encPath(folder) + ':', { method: 'DELETE' });
+      if (r.status === 404) return;
+      if (!r.ok) throw new Error('OneDrive : suppression impossible (' + r.status + ')');
+    },
   };
 
   const Store = CFG.provider === 'onedrive' ? OneDrive : Dropbox;
@@ -218,7 +229,7 @@
      conflicts : clés en conflit (fichier changé dans le cloud ET sur le téléphone) */
   function loadState() {
     const s = ls.get(LS_STATE) || {};
-    return { files: s.files || {}, data: s.data || {}, dirty: s.dirty || {}, conflicts: s.conflicts || {}, lastSync: s.lastSync || null };
+    return { files: s.files || {}, data: s.data || {}, dirty: s.dirty || {}, conflicts: s.conflicts || {}, deletes: s.deletes || {}, lastSync: s.lastSync || null };
   }
 
   const keyFiles = (k, v) => {
@@ -278,13 +289,14 @@
         try {
           if (typeof navigator !== 'undefined' && navigator.onLine === false) throw Object.assign(new Error('hors ligne'), { offline: true });
           await this.push();
+          await this.processDeletes();
           let changed = false;
           for (const k of pull) if (!this.state.dirty[k] && !this.state.conflicts[k]) changed = (await this.pull(k)) || changed;
           this.state.lastSync = new Date().toISOString();
           this.persist();
           const nConf = Object.keys(this.state.conflicts).length;
           if (nConf) this.setStatus('conflict', 'Conflit : des données ont changé sur ' + P.drive + ' et sur ce téléphone.');
-          else if (Object.keys(this.state.dirty).length) this.setStatus('pending', 'Modifications en attente d’envoi');
+          else if (Object.keys(this.state.dirty).length || Object.keys(this.state.deletes || {}).length) this.setStatus('pending', 'Modifications en attente d’envoi');
           else this.setStatus('ok', 'À jour avec ' + P.drive);
           if (changed && reloadIfChanged && !nConf) { UI.reload('Données mises à jour depuis ' + P.drive + '.'); }
         } catch (e) {
@@ -324,6 +336,28 @@
       }
     },
 
+    /* Suppression d'un utilisateur (compte supprimé ou renommé) : effacé tout de suite sur le téléphone,
+       puis dans le cloud (immédiatement, ou au retour du réseau). */
+    async remove(k) {
+      const folder = 'utilisateurs/' + k.slice(8);
+      clearTimeout(this.timers[k]);
+      delete this.cache[k]; delete this.state.data[k]; delete this.state.dirty[k]; delete this.state.conflicts[k];
+      for (const p of Object.keys(this.state.files)) if (p.startsWith(folder + '/')) delete this.state.files[p];
+      this.state.deletes = this.state.deletes || {};
+      this.state.deletes[folder] = true;
+      this.persist();
+      await this.syncAll({});
+    },
+    async processDeletes() {
+      // Jamais pendant un conflit : on attend que l'utilisateur ait choisi quelle version garder.
+      if (Object.keys(this.state.conflicts).length) return;
+      for (const folder of Object.keys(this.state.deletes || {})) {
+        await Graph.remove(folder);
+        delete this.state.deletes[folder];
+        this.persist();
+      }
+    },
+
     /* Récupère depuis le cloud les fichiers qui ont changé. Renvoie true si quelque chose a changé. */
     async pull(k) {
       const folder = k === 'fc_accounts' ? '' : 'utilisateurs/' + k.slice(8);
@@ -340,6 +374,13 @@
         this.state.files[path] = { etag: info.etag, text };
         texts[name] = text;
         if (!known || known.text !== text) changed = true;
+      }
+      const accs = this.cache.fc_accounts;
+      if (k !== 'fc_accounts' && texts['profil.csv'] === null && accs && Object.keys(accs).length && !accs[k.slice(8)]) {
+        // Compte supprimé depuis un autre appareil : on ne le recrée pas, on efface la copie du téléphone.
+        const had = this.state.data[k] !== undefined && this.state.data[k] !== null;
+        delete this.state.data[k]; this.cache[k] = null; delete this.state.dirty[k];
+        return had;
       }
       if (!changed && k in this.state.data) return false;
       const v = k === 'fc_accounts' ? CSV.accountsFromCSV(texts['comptes.csv']) : CSV.filesToData(texts);

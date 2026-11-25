@@ -29,13 +29,22 @@
       this.timers[k] = setTimeout(() => this.flush(k), 200);
     },
     flush(k, keepalive) {
-      if (!this.pending[k]) return;
+      if (!this.pending[k]) return Promise.resolve(true);
       this.pending[k] = false;
-      fetch(this.url(k), { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(this.cache[k]), keepalive: !!keepalive })
-        .then((r) => { if (!r.ok) throw new Error(r.status); })
-        .catch(() => { this.pending[k] = true; toast("⚠ Impossible d'enregistrer dans les fichiers CSV. Le serveur Finance_Care est-il toujours lancé ?", 'critical', 8000); });
+      return fetch(this.url(k), { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(this.cache[k]), keepalive: !!keepalive })
+        .then((r) => { if (!r.ok) throw new Error(r.status); return true; })
+        .catch(() => { this.pending[k] = true; toast("⚠ Impossible d'enregistrer dans les fichiers CSV. Le serveur Finance_Care est-il toujours lancé ?", 'critical', 8000); return false; });
     },
-    flushAll(keepalive) { for (const k of Object.keys(this.pending)) { clearTimeout(this.timers[k]); this.flush(k, keepalive); } },
+    flushAll(keepalive) { return Promise.all(Object.keys(this.pending).map((k) => { clearTimeout(this.timers[k]); return this.flush(k, keepalive); })); },
+    /* Supprime les fichiers d'un utilisateur (après avoir enregistré tout le reste). */
+    async remove(k) {
+      clearTimeout(this.timers[k]); delete this.pending[k];
+      const ok = (await this.flushAll()).every(Boolean);
+      if (!ok) throw new Error("enregistrement impossible : suppression annulée");
+      const r = await fetch(this.url(k), { method: 'DELETE', headers: { 'X-Finance-Care': 'supprimer' } });
+      if (!r.ok) throw new Error('suppression impossible (' + r.status + ')');
+      delete this.cache[k];
+    },
   };
   window.addEventListener('pagehide', () => Backend.flushAll(true));
 
@@ -52,6 +61,11 @@
       try { localStorage.setItem(k, s); } catch (e) { memory[k] = s; }
     },
     del(k) { try { localStorage.removeItem(k); } catch (e) { delete memory[k]; } },
+    /* Suppression définitive des données d'une clé (fichiers CSV / Dropbox / navigateur). */
+    async remove(k) {
+      if (Backend.handles(k) && Backend.remove) await Backend.remove(k);
+      else this.del(k);
+    },
   };
   const Session = {
     get() { try { return sessionStorage.getItem('fc_session') || Store.get('fc_remember'); } catch (e) { return Store.get('fc_remember'); } },
@@ -74,20 +88,54 @@
   }
 
   /* ================= État ================= */
-  const S = { user: null, data: null, month: null, route: 'tableau', filters: {}, onboardStep: 0 };
+  const S = { user: null, data: null, month: null, route: 'tableau', filters: {}, onboardStep: 0, sel: [] };
   const today = () => FC.toISODate(new Date());
   const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
   const dataKey = (u) => 'fc_data_' + u;
 
+  const DEFAULT_BANK = { id: 'principal', name: 'Compte principal', type: 'courant', color: '#1b64be', initialBalance: 0, archived: false };
+  const BANK_TYPES = { courant: 'Compte courant', epargne: "Compte d'épargne", livret: 'Livret', joint: 'Compte joint', especes: 'Espèces', autre: 'Autre' };
+  const BANK_COLORS = ['#1b64be', '#00a37a', '#e0702a', '#7b4fd6', '#d63d7a', '#2f8fae', '#b8860b', '#5b6b7f'];
   function newData(name) {
     return {
-      version: 1, onboarded: false,
-      profile: { name: name || '', currency: 'EUR', salary: { amount: 0, frequency: 'mensuel', day: 1 } },
+      version: 2, onboarded: false,
+      profile: { name: name || '', currency: 'EUR', salary: { amount: 0, frequency: 'mensuel', day: 1, accountId: DEFAULT_BANK.id } },
+      accounts: [{ ...DEFAULT_BANK }],
       categories: FC.DEFAULT_CATEGORIES.map((c) => ({ ...c })),
       incomes: [], expenses: [], recurring: [], budgets: {}, goals: [],
     };
   }
   function save() { Store.set(dataKey(S.user), S.data); }
+
+  /* ----- Comptes bancaires : sélection (un, plusieurs ou tous) ----- */
+  const banks = () => S.data.accounts;
+  const activeBanks = () => S.data.accounts.filter((a) => !a.archived);
+  const bank = (id) => S.data.accounts.find((a) => a.id === id) || S.data.accounts[0];
+  const selKey = () => 'fc_sel_' + S.user;
+  function loadSel() {
+    const ids = new Set(S.data.accounts.map((a) => a.id));
+    const v = Store.get(selKey());
+    S.sel = Array.isArray(v) ? v.filter((id) => ids.has(id)) : [];
+  }
+  function setSel(ids) {
+    const all = S.data.accounts.map((a) => a.id);
+    S.sel = ids.length >= all.length && all.every((id) => ids.includes(id)) ? [] : ids;
+    Store.set(selKey(), S.sel);
+  }
+  /* Données vues à travers la sélection de comptes (lecture seule : les modifications passent par S.data). */
+  const V = () => FC.scopeData(S.data, S.sel);
+  const multiBank = () => S.data.accounts.length > 1;
+  function defaultBankId() {
+    if (S.sel.length === 1) return S.sel[0];
+    const sal = S.data.profile.salary.accountId;
+    return (activeBanks().find((a) => a.id === sal) || activeBanks()[0] || S.data.accounts[0]).id;
+  }
+  const bankOptions = (keepId) => S.data.accounts.filter((a) => !a.archived || a.id === keepId).map((a) => ({ value: a.id, label: a.name + (a.archived ? ' (archivé)' : '') }));
+  const bankField = (keepId) => ({ name: 'accountId', label: 'Compte', type: 'select', options: bankOptions(keepId) });
+  function selectionLabel() {
+    if (!S.sel.length) return multiBank() ? 'Tous les comptes' : '';
+    return S.sel.map((id) => bank(id).name).join(' + ');
+  }
 
   /* ================= Utilitaires d'affichage ================= */
   const esc = (s) => String(s === undefined || s === null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -337,6 +385,7 @@
     S.user = u;
     S.data = Store.get(dataKey(u)) || newData(u);
     migrate(S.data);
+    loadSel();
     S.month = FC.monthOf(today());
     const added = FC.applyRecurring(S.data, today(), uid);
     save();
@@ -347,14 +396,38 @@
   function migrate(d) {
     d.recurring = d.recurring || []; d.budgets = d.budgets || {}; d.goals = d.goals || [];
     d.incomes = d.incomes || []; d.expenses = d.expenses || []; d.categories = d.categories || FC.DEFAULT_CATEGORIES.map((c) => ({ ...c }));
+    // Version 2 : comptes bancaires. Les anciennes opérations vont dans le premier compte (« Compte principal »).
+    if (!Array.isArray(d.accounts) || !d.accounts.length) d.accounts = [{ ...DEFAULT_BANK }];
+    const ids = new Set(d.accounts.map((a) => a.id)), first = d.accounts[0].id;
+    for (const list of [d.incomes, d.expenses, d.recurring]) for (const x of list) if (!ids.has(x.accountId)) x.accountId = first;
+    d.profile.salary = d.profile.salary || { amount: 0, frequency: 'mensuel', day: 1 };
+    if (!ids.has(d.profile.salary.accountId)) d.profile.salary.accountId = first;
+    d.version = Math.max(d.version || 1, 2);
   }
-  function logout() { Session.clear(); S.user = null; S.data = null; location.hash = ''; renderAuth('login'); }
+  function logout() { Session.clear(); S.user = null; S.data = null; S.sel = []; location.hash = ''; renderAuth('login'); }
 
   /* ================= Mise en page ================= */
   const NAV = [
     ['tableau', 'Tableau de bord', '◎'], ['revenus', 'Revenus', '↓'], ['depenses', 'Dépenses', '↑'],
-    ['budget', 'Budget', '▤'], ['epargne', 'Épargne', '◆'], ['historique', 'Historique & bilan', '◷'], ['parametres', 'Paramètres', '⚙'],
+    ['budget', 'Budget', '▤'], ['epargne', 'Épargne', '◆'], ['historique', 'Historique & bilan', '◷'],
+    ['comptes', 'Comptes bancaires', '▣'], ['profil', 'Mon compte', '☺'], ['parametres', 'Paramètres', '⚙'],
   ];
+  /* Barre du bas (téléphone) : 4 onglets + bouton « + » au centre ; le reste est dans « Plus ». */
+  const TABS = [['tableau', 'Accueil', '◎'], ['depenses', 'Dépenses', '↑'], null, ['budget', 'Budget', '▤'], ['__more', 'Plus', '☰']];
+  const initials = () => (S.data.profile.name || S.user || '?').trim().charAt(0).toUpperCase();
+  /* Sélecteur de comptes bancaires : « Tous » ou un, deux, trois… comptes. */
+  function bankBar() {
+    if (!multiBank()) return '';
+    const t = today();
+    const list = activeBanks().concat(S.data.accounts.filter((a) => a.archived && S.sel.includes(a.id)));
+    const total = FC.sum(S.sel.length ? S.sel : S.data.accounts.map((a) => a.id), (id) => FC.accountBalance(S.data, id, t));
+    return `<div class="bankbar" role="group" aria-label="Comptes affichés">
+      <button class="chip ${S.sel.length ? '' : 'on'}" data-action="sel-all" aria-pressed="${!S.sel.length}">Tous</button>
+      ${list.map((a) => { const on = S.sel.includes(a.id); return `<button class="chip ${on ? 'on' : ''}" data-action="sel-bank" data-id="${esc(a.id)}" aria-pressed="${on}" style="--c:${esc(a.color)}">
+        <span class="dot" aria-hidden="true"></span>${esc(a.name)}<small>${money(FC.accountBalance(S.data, a.id, t))}</small></button>`; }).join('')}
+      <span class="bankbar-total">${S.sel.length > 1 ? 'Total sélection' : S.sel.length ? 'Solde' : 'Total'} : <strong>${money(total)}</strong></span>
+    </div>`;
+  }
   function monthNav() {
     const cur = FC.monthOf(today());
     return `<div class="month-nav">
@@ -368,26 +441,37 @@
     if (!S.user) return renderAuth();
     if (!S.data.onboarded) S.route = 'bienvenue';
     if (S.route === 'bienvenue') return renderOnboarding();
-    const views = { tableau: viewDashboard, revenus: viewIncomes, depenses: viewExpenses, budget: viewBudget, epargne: viewSavings, historique: viewHistory, parametres: viewSettings };
-    const view = views[S.route] || viewDashboard;
+    const views = { tableau: viewDashboard, revenus: viewIncomes, depenses: viewExpenses, budget: viewBudget, epargne: viewSavings, historique: viewHistory, comptes: viewBanks, profil: viewProfile, parametres: viewSettings };
+    if (!views[S.route]) S.route = 'tableau';
+    const view = views[S.route];
     const title = (NAV.find((n) => n[0] === S.route) || NAV[0])[1];
     const showMonth = ['tableau', 'revenus', 'depenses', 'budget', 'historique'].includes(S.route);
+    const showBanks = ['tableau', 'revenus', 'depenses', 'budget', 'historique'].includes(S.route);
+    const moreActive = !TABS.some((x) => x && x[0] === S.route);
     document.getElementById('app').innerHTML = `
       <div class="layout">
         <aside class="sidebar">
           <div class="brand"><span class="logo">FC</span> Finance_Care</div>
           <nav>${NAV.map(([k, l, i]) => `<a href="#${k}" class="${S.route === k ? 'active' : ''}"><span class="nav-ic" aria-hidden="true">${i}</span>${l}</a>`).join('')}</nav>
-          <div class="user">Bonjour ${esc(S.data.profile.name || S.user)}<button class="btn small ghost" data-action="logout">Déconnexion</button></div>
+          <div class="user"><a href="#profil" class="user-link"><span class="avatar" aria-hidden="true">${esc(initials())}</span>${esc(S.data.profile.name || S.user)}</a><button class="btn small ghost" data-action="logout">Déconnexion</button></div>
         </aside>
         <main>
           <header class="topbar"><h1>${title}</h1>${showMonth ? monthNav() : ''}
+            <a href="#profil" class="avatar m-only" aria-label="Mon compte">${esc(initials())}</a>
             <div class="quick">
               <button class="btn" data-action="add-income">+ Revenu</button>
               <button class="btn primary" data-action="add-expense">+ Dépense</button>
             </div>
           </header>
+          ${showBanks ? bankBar() : ''}
           <div class="content">${view()}</div>
         </main>
+        <nav class="tabbar" aria-label="Navigation principale">
+          ${TABS.map((x) => x ? (x[0] === '__more'
+            ? `<button class="${moreActive ? 'active' : ''}" data-action="more-menu"><span aria-hidden="true">${x[2]}</span>${x[1]}</button>`
+            : `<a href="#${x[0]}" class="${S.route === x[0] ? 'active' : ''}"><span aria-hidden="true">${x[2]}</span>${x[1]}</a>`)
+            : `<button class="tab-add" data-action="quick-add" aria-label="Ajouter une opération">+</button>`).join('')}
+        </nav>
       </div>`;
   }
 
@@ -406,7 +490,10 @@
           { name: 'amount', label: 'Salaire net par versement', type: 'money', required: true },
           { name: 'frequency', label: 'Fréquence de versement', type: 'select', options: freqOptions() },
           { name: 'day', label: 'Jour de versement (mensuel)', type: 'number', min: 1, max: 31 },
-        ], { name: d.profile.name, currency: d.profile.currency, amount: d.profile.salary.amount || '', frequency: d.profile.salary.frequency, day: d.profile.salary.day })}
+          { name: 'bankName', label: 'Nom de votre compte bancaire principal', placeholder: 'ex. Compte courant' },
+          { name: 'bankBalance', label: 'Solde actuel de ce compte', type: 'money', min: -1e9, help: 'Vous pourrez ajouter d\'autres comptes (livret, compte joint…) plus tard.' },
+        ], { name: d.profile.name, currency: d.profile.currency, amount: d.profile.salary.amount || '', frequency: d.profile.salary.frequency, day: d.profile.salary.day,
+          bankName: d.accounts[0].name, bankBalance: d.accounts[0].initialBalance || '' })}
         ${field({ name: 'recordSalary', label: 'Enregistrer aussi le salaire de ce mois dans mes revenus', type: 'checkbox' }, true)}
         <div class="actions"><button class="btn primary" type="submit">Continuer</button></div>
       </form>`;
@@ -446,11 +533,13 @@
     if (!requireFields(form, ['name', 'amount'])) return;
     const d = S.data;
     d.profile.name = o.name.trim(); d.profile.currency = o.currency;
-    d.profile.salary = { amount: num(o.amount), frequency: o.frequency, day: Math.min(31, Math.max(1, parseInt(o.day, 10) || 1)) };
+    d.profile.salary = { amount: num(o.amount), frequency: o.frequency, day: Math.min(31, Math.max(1, parseInt(o.day, 10) || 1)), accountId: d.accounts[0].id };
+    if (o.bankName && o.bankName.trim()) d.accounts[0].name = o.bankName.trim();
+    d.accounts[0].initialBalance = FC.round2(num(o.bankBalance));
     if (o.recordSalary && num(o.amount) > 0) {
       const m = FC.monthOf(today());
       if (!d.incomes.some((i) => i.type === 'salaire' && FC.monthOf(i.date) === m)) {
-        d.incomes.push({ id: uid(), date: today(), amount: num(o.amount), type: 'salaire', label: 'Salaire' });
+        d.incomes.push({ id: uid(), date: today(), amount: num(o.amount), type: 'salaire', label: 'Salaire', accountId: d.accounts[0].id });
       }
     }
     save(); S.onboardStep = 1; render();
@@ -469,7 +558,7 @@
 
   /* ================= Tableau de bord (2.6) ================= */
   function viewDashboard() {
-    const d = S.data, t = today(), m = S.month;
+    const d = V(), t = today(), m = S.month;
     const s = FC.monthSummary(d, m, t);
     const f = FC.forecast(d, m, t);
     const a = FC.salaryAllocation(d, m);
@@ -526,10 +615,35 @@
       </div>`; }).join('') : '<p class="empty">Aucun objectif. <a href="#epargne">Créer un objectif</a></p>'}
     </div>`;
 
-    return `${alerts}${kpis}
-      <div class="card summary"><h2>Résumé de ${monthLabel(m).toLowerCase()}</h2>${summaryText(s, f, a, goals, t)}</div>
-      <div class="grid2">${fc}${allocCard}</div>
+    const alertsPhone = s.alerts.length ? `<details class="alerts-compact m-only ${s.alerts.some((al) => al.level === 'over') ? 'critical' : 'warning'}"><summary><span aria-hidden="true">⚠</span> ${s.alerts.length} alerte(s) de budget</summary>${s.alerts.map((al) => `<p>${al.level === 'over' ? '✕' : '⚠'} ${esc(al.text)}</p>`).join('')}</details>` : '';
+    return `${heroCard(d, s, t)}${alertsPhone}<div class="m-hide">${alerts}</div>${kpis}
+      ${recentCard(d)}
+      <div class="card summary m-hide"><h2>Résumé de ${monthLabel(m).toLowerCase()}</h2>${summaryText(s, f, a, goals, t)}</div>
+      <div class="grid2">${fc}<div class="m-hide">${allocCard}</div></div>
       <div class="grid2">${catCard}${goalsCard}</div>`;
+  }
+  /* Carte principale : solde des comptes affichés + entrées / sorties du mois (très lisible sur téléphone). */
+  function heroCard(d, s, t) {
+    const ids = S.sel.length ? S.sel : S.data.accounts.filter((a) => !a.archived).map((a) => a.id);
+    const total = FC.sum(ids, (id) => FC.accountBalance(S.data, id, t));
+    return `<div class="hero-card">
+      <div class="hero-top"><span>${esc(S.sel.length ? selectionLabel() : multiBank() ? 'Tous mes comptes' : bank(ids[0]).name)}</span><a href="#comptes">Gérer</a></div>
+      <div class="hero-amount ${total < 0 ? 'neg' : ''}">${money(total)}</div>
+      <div class="hero-flows"><span>↓ Entrées <strong>${money(s.totalIncome)}</strong></span><span>↑ Sorties <strong>${money(s.totalExpenses)}</strong></span><span>Solde du mois <strong>${money(s.balance)}</strong></span></div>
+      ${ids.length > 1 ? `<div class="hero-banks">${ids.map((id) => { const a = bank(id); return `<span><i style="background:${esc(a.color)}"></i>${esc(a.name)} <b>${money(FC.accountBalance(S.data, id, t))}</b></span>`; }).join('')}</div>` : ''}
+    </div>`;
+  }
+  /* Dernières opérations (revenus et dépenses mélangés), en liste simple. */
+  function recentCard(d) {
+    const ops = d.incomes.map((i) => ({ ...i, sign: 1, label: i.label || 'Revenu', kind: 'income' }))
+      .concat(d.expenses.map((e) => ({ ...e, sign: -1, label: e.label || cat(e.categoryId).name, kind: 'expense' })))
+      .filter((x) => x.date <= today()).sort((x, y) => y.date.localeCompare(x.date)).slice(0, 6);
+    return `<div class="card recent"><div class="card-head"><h2>Dernières opérations</h2><a href="#depenses" class="small">Tout voir</a></div>
+      ${ops.length ? `<ul class="ops">${ops.map((x) => `<li data-action="edit-${x.kind}" data-id="${esc(x.id)}">
+        <span class="op-ic" style="background:${x.sign > 0 ? 'var(--good)' : esc(cat(x.categoryId).color)}" aria-hidden="true">${x.sign > 0 ? '↓' : '↑'}</span>
+        <span class="op-main"><strong>${esc(x.label)}</strong><small>${dateFr(x.date)}${multiBank() ? ' · ' + esc(bank(x.accountId).name) : ''}</small></span>
+        <span class="op-amt ${x.sign > 0 ? 'pos' : ''}">${x.sign > 0 ? '+' : '−'}${money(x.amount)}</span></li>`).join('')}</ul>` : '<p class="empty">Aucune opération pour le moment.</p>'}
+    </div>`;
   }
   function kpi(label, value, sub, cls = '') { return `<div class="kpi ${cls}"><span class="kpi-label">${label}</span><span class="kpi-value">${value}</span><span class="kpi-sub">${sub || ''}</span></div>`; }
   function budgetRow(c) {
@@ -559,7 +673,7 @@
 
   /* ================= Revenus (2.1) ================= */
   function viewIncomes() {
-    const d = S.data, m = S.month, all = S.filters.incomesAll;
+    const d = V(), m = S.month, all = S.filters.incomesAll;
     const list = d.incomes.filter((i) => all || FC.monthOf(i.date) === m).sort((x, y) => y.date.localeCompare(x.date));
     const s = FC.monthSummary(d, m, today());
     const extra = FC.round2(s.totalIncome - s.salaryIncome);
@@ -573,11 +687,12 @@
         <div class="card-head"><h2>Historique des revenus</h2>
           <div class="seg small"><label><input type="radio" name="incall" data-change="incomes-all" value="0" ${all ? '' : 'checked'}><span>Ce mois</span></label><label><input type="radio" name="incall" data-change="incomes-all" value="1" ${all ? 'checked' : ''}><span>Tout l'historique</span></label></div>
         </div>
-        ${list.length ? txTable(list.map((i) => ({ id: i.id, date: i.date, label: i.label || (i.type === 'salaire' ? 'Salaire' : 'Revenu'), tag: i.type === 'salaire' ? 'Salaire' : 'Supplémentaire', amount: i.amount })), 'income', all) : '<p class="empty">Aucun revenu enregistré pour cette période.</p>'}
+        ${list.length ? txTable(list.map((i) => ({ id: i.id, date: i.date, label: i.label || (i.type === 'salaire' ? 'Salaire' : 'Revenu'), tag: i.type === 'salaire' ? 'Salaire' : 'Supplémentaire', amount: i.amount, accountId: i.accountId })), 'income', all) : '<p class="empty">Aucun revenu enregistré pour cette période.</p>'}
       </div>`;
   }
+  const bankTag = (id) => { if (!multiBank() || !id) return ''; const a = bank(id); return ` <span class="tag bank" style="--c:${esc(a.color)}">${esc(a.name)}</span>`; };
   function txTable(rows, kind, grouped) {
-    let html = '<table class="tx"><thead><tr><th>Date</th><th>Libellé</th><th>Type</th><th class="num">Montant</th><th></th></tr></thead><tbody>';
+    let html = '<table class="tx list"><thead><tr><th>Date</th><th>Libellé</th><th>Type</th><th class="num">Montant</th><th></th></tr></thead><tbody>';
     let lastMonth = null;
     for (const r of rows) {
       const mo = FC.monthOf(r.date);
@@ -587,7 +702,7 @@
         lastMonth = mo;
       }
       html += `<tr><td>${dateFr(r.date)}</td><td>${r.dot ? `<span class="sw" style="background:${r.dot}"></span>` : ''}${esc(r.label)}${r.recurring ? ' <span class="tag" title="Dépense récurrente">↻</span>' : ''}</td>
-        <td>${r.tagHtml || `<span class="tag">${esc(r.tag)}</span>`}</td><td class="num">${money(r.amount)}</td>
+        <td>${r.tagHtml || `<span class="tag">${esc(r.tag)}</span>`}${bankTag(r.accountId)}</td><td class="num">${money(r.amount)}</td>
         <td class="row-actions"><button class="icon-btn" data-action="edit-${kind}" data-id="${r.id}" aria-label="Modifier">✎</button><button class="icon-btn" data-action="del-${kind}" data-id="${r.id}" aria-label="Supprimer">🗑</button></td></tr>`;
     }
     return html + '</tbody></table>';
@@ -599,10 +714,11 @@
       { name: 'amount', label: 'Montant', type: 'money', required: true },
       { name: 'date', label: 'Date', type: 'date', required: true },
       { name: 'label', label: 'Libellé', placeholder: 'ex. Salaire, prime, freelance…' },
-    ], i) + (!inc && S.data.goals.some((g) => Number(g.percent) > 0) ? field({ name: 'split', label: "Si c'est un salaire : répartir automatiquement l'épargne vers mes objectifs", type: 'checkbox' }, true) : ''),
+      ...(multiBank() ? [bankField(i.accountId)] : []),
+    ], { accountId: inc ? inc.accountId : (S.sel.length === 1 ? S.sel[0] : S.data.profile.salary.accountId || defaultBankId()), ...i }) + (!inc && S.data.goals.some((g) => Number(g.percent) > 0) ? field({ name: 'split', label: "Si c'est un salaire : répartir automatiquement l'épargne vers mes objectifs", type: 'checkbox' }, true) : ''),
     (o, form) => {
       if (!requireFields(form, ['amount', 'date'])) return;
-      const rec = { date: o.date, amount: FC.round2(num(o.amount)), type: o.type || 'supplementaire', label: o.label.trim() };
+      const rec = { date: o.date, amount: FC.round2(num(o.amount)), type: o.type || 'supplementaire', label: o.label.trim(), accountId: o.accountId || (inc && inc.accountId) || defaultBankId() };
       if (rec.amount <= 0) return toast('Le montant doit être positif.', 'warning');
       if (inc) Object.assign(inc, rec); else S.data.incomes.push({ id: uid(), ...rec });
       save(); closeModal(); S.month = FC.monthOf(rec.date); render();
@@ -630,7 +746,7 @@
 
   /* ================= Dépenses (2.2) & récurrentes (3.1) ================= */
   function viewExpenses() {
-    const d = S.data, m = S.month, F = S.filters;
+    const d = V(), m = S.month, F = S.filters;
     let list = d.expenses.filter((e) => F.expensesAll || FC.monthOf(e.date) === m);
     if (F.expCat) list = list.filter((e) => e.categoryId === F.expCat);
     if (F.expKind) list = list.filter((e) => e.kind === F.expKind);
@@ -652,16 +768,16 @@
           </div>
         </div>
         ${list.length ? txTable(list.map((e) => { const c = cat(e.categoryId); return { id: e.id, date: e.date, label: e.label || c.name, dot: c.color, recurring: !!e.recurringId,
-          tagHtml: `<span class="tag">${esc(c.name)}</span> <span class="tag ${e.kind === 'fixe' ? 'fixed' : ''}">${e.kind === 'fixe' ? 'Fixe' : 'Variable'}</span>`, amount: e.amount }; }), 'expense', F.expensesAll) + `<p class="help right">Total affiché : <strong>${money(FC.sum(list, (e) => e.amount))}</strong></p>` : '<p class="empty">Aucune dépense pour cette période.</p>'}
+          tagHtml: `<span class="tag">${esc(c.name)}</span> <span class="tag kind ${e.kind === 'fixe' ? 'fixed' : ''}">${e.kind === 'fixe' ? 'Fixe' : 'Variable'}</span>`, amount: e.amount, accountId: e.accountId }; }), 'expense', F.expensesAll) + `<p class="help right">Total affiché : <strong>${money(FC.sum(list, (e) => e.amount))}</strong></p>` : '<p class="empty">Aucune dépense pour cette période.</p>'}
       </div>
       <div class="card">
         <div class="card-head"><h2>Dépenses récurrentes</h2><button class="btn" data-action="add-recurring">+ Dépense récurrente</button></div>
         <p class="muted">Loyer, abonnements, assurances… Elles sont ajoutées automatiquement chaque mois à leur date et comptées dans le budget dès le début du mois.</p>
-        ${rec.length ? `<table class="tx"><thead><tr><th>Libellé</th><th>Catégorie</th><th>Jour</th><th class="num">Montant</th><th>Statut</th><th></th></tr></thead><tbody>
-          ${rec.map((r) => `<tr class="${r.active ? '' : 'inactive'}"><td>${esc(r.label)}</td><td><span class="sw" style="background:${cat(r.categoryId).color}"></span>${esc(cat(r.categoryId).name)}</td><td>le ${r.day}</td><td class="num">${money(r.amount)}</td>
+        ${rec.length ? `<div class="scroll"><table class="tx rec"><thead><tr><th>Libellé</th><th>Catégorie</th><th>Jour</th><th class="num">Montant</th><th>Statut</th><th></th></tr></thead><tbody>
+          ${rec.map((r) => `<tr class="${r.active ? '' : 'inactive'}"><td>${esc(r.label)}</td><td><span class="sw" style="background:${cat(r.categoryId).color}"></span>${esc(cat(r.categoryId).name)}${bankTag(r.accountId)}</td><td>le ${r.day}</td><td class="num">${money(r.amount)}</td>
             <td><button class="btn small ghost" data-action="toggle-recurring" data-id="${r.id}">${r.active ? 'Active' : 'En pause'}</button></td>
             <td class="row-actions"><button class="icon-btn" data-action="edit-recurring" data-id="${r.id}" aria-label="Modifier">✎</button><button class="icon-btn" data-action="del-recurring" data-id="${r.id}" aria-label="Supprimer">🗑</button></td></tr>`).join('')}
-          </tbody></table><p class="help right">Total mensuel des récurrentes actives : <strong>${money(FC.sum(rec.filter((r) => r.active), (r) => r.amount))}</strong></p>` : '<p class="empty">Aucune dépense récurrente.</p>'}
+          </tbody></table></div><p class="help right">Total mensuel des récurrentes actives : <strong>${money(FC.sum(rec.filter((r) => r.active), (r) => r.amount))}</strong></p>` : '<p class="empty">Aucune dépense récurrente.</p>'}
       </div>`;
   }
   function expenseForm(exp) {
@@ -672,15 +788,16 @@
       { name: 'categoryId', label: 'Catégorie', type: 'select', options: catOptions() },
       { name: 'kind', label: 'Type de dépense', type: 'radio', options: [{ value: 'variable', label: 'Variable' }, { value: 'fixe', label: 'Fixe' }] },
       { name: 'label', label: 'Description', placeholder: 'ex. Courses, essence…', wide: true },
-    ], e), (o, form) => {
+      ...(multiBank() ? [bankField(e.accountId)] : []),
+    ], { accountId: defaultBankId(), ...e }), (o, form) => {
       if (!requireFields(form, ['amount', 'date'])) return;
-      const rec = { date: o.date, amount: FC.round2(num(o.amount)), categoryId: o.categoryId, kind: o.kind || 'variable', label: o.label.trim() };
+      const rec = { date: o.date, amount: FC.round2(num(o.amount)), categoryId: o.categoryId, kind: o.kind || 'variable', label: o.label.trim(), accountId: o.accountId || (exp && exp.accountId) || defaultBankId() };
       if (rec.amount <= 0) return toast('Le montant doit être positif.', 'warning');
-      const before = FC.monthSummary(S.data, FC.monthOf(rec.date), today());
+      const before = FC.monthSummary(V(), FC.monthOf(rec.date), today());
       if (exp) Object.assign(exp, rec); else S.data.expenses.push({ id: uid(), ...rec });
       save(); closeModal(); S.month = FC.monthOf(rec.date); render();
       toast(exp ? 'Dépense modifiée.' : 'Dépense enregistrée.', 'good');
-      budgetToast(before, FC.monthSummary(S.data, S.month, today()), rec.categoryId);
+      budgetToast(before, FC.monthSummary(V(), S.month, today()), rec.categoryId);
     });
   }
   /* Après chaque dépense : budget restant + alerte si proche de la limite ou dépassé */
@@ -707,9 +824,10 @@
       { name: 'day', label: 'Jour du mois', type: 'number', min: 1, max: 31, required: true },
       { name: 'startMonth', label: 'À partir de', type: 'month', required: true },
       { name: 'endMonth', label: "Jusqu'à (facultatif)", type: 'month' },
-    ], v), (o, form) => {
+      ...(multiBank() ? [bankField(v.accountId)] : []),
+    ], { accountId: defaultBankId(), ...v }), (o, form) => {
       if (!requireFields(form, ['label', 'amount', 'day', 'startMonth'])) return;
-      const rec = { label: o.label.trim(), amount: FC.round2(num(o.amount)), categoryId: o.categoryId, day: Math.min(31, Math.max(1, parseInt(o.day, 10) || 1)), startMonth: o.startMonth, endMonth: o.endMonth || '' };
+      const rec = { label: o.label.trim(), amount: FC.round2(num(o.amount)), categoryId: o.categoryId, day: Math.min(31, Math.max(1, parseInt(o.day, 10) || 1)), startMonth: o.startMonth, endMonth: o.endMonth || '', accountId: o.accountId || (r && r.accountId) || defaultBankId() };
       if (rec.amount <= 0) return toast('Le montant doit être positif.', 'warning');
       if (r) {
         Object.assign(r, rec);
@@ -723,7 +841,7 @@
 
   /* ================= Budget (2.3) ================= */
   function viewBudget() {
-    const d = S.data, m = S.month;
+    const d = V(), m = S.month;
     const s = FC.monthSummary(d, m, today());
     const b = s.budget;
     const catTotal = FC.sum(Object.values(b.categories || {}));
@@ -744,6 +862,7 @@
         ${s.byCategory.some((c) => c.budget || c.spent) ? groupedBars(s.byCategory.filter((c) => c.budget || c.spent).map((c) => ({ label: c.name.length > 11 ? c.name.slice(0, 10) + '…' : c.name, tipLabel: c.name, values: [c.budget, c.spent] })),
           [{ name: 'Budget prévu', color: FC.PALETTE[0] }, { name: 'Dépenses réelles', color: FC.PALETTE[1] }], { aria: 'Budget prévu et dépenses réelles par catégorie' }) : ''}
       </div>
+      ${S.sel.length ? `<p class="hint">Dépenses des comptes sélectionnés (${esc(selectionLabel())}) comparées à votre budget, qui reste commun à tous les comptes.</p>` : ''}
       <form class="card" data-form="budget" novalidate>
         <div class="card-head"><h2>Définir le budget de ${monthLabel(m).toLowerCase()}</h2></div>
         ${b.inherited && b.from ? `<p class="muted">Aucun budget spécifique pour ce mois : celui de ${monthLabel(b.from).toLowerCase()} s'applique. Enregistrez pour le personnaliser.</p>` : ''}
@@ -873,14 +992,14 @@
       { name: 'day', label: 'Jour de versement', type: 'number', min: 1, max: 31 },
     ], s), (o, form) => {
       if (!requireFields(form, ['amount'])) return;
-      S.data.profile.salary = { amount: FC.round2(num(o.amount)), frequency: o.frequency, day: Math.min(31, Math.max(1, parseInt(o.day, 10) || 1)) };
+      S.data.profile.salary = { ...S.data.profile.salary, amount: FC.round2(num(o.amount)), frequency: o.frequency, day: Math.min(31, Math.max(1, parseInt(o.day, 10) || 1)) };
       save(); closeModal(); render(); toast('Salaire mis à jour : les montants d\'épargne ont été recalculés.', 'good');
     });
   }
 
   /* ================= Historique, comparaison et bilan (3.2, §4 étape 8) ================= */
   function viewHistory() {
-    const d = S.data, t = today(), m = S.month;
+    const d = V(), t = today(), m = S.month;
     const months = FC.monthRange(FC.addMonths(m, -11), m);
     const h = FC.history(d, months, t);
     const firstActive = h.findIndex((r) => r.income || r.expenses || r.savings);
@@ -933,7 +1052,7 @@
   }
   function prepareNextBudget() {
     const m = S.month, next = FC.addMonths(m, 1);
-    const s = FC.monthSummary(S.data, m, today());
+    const s = FC.monthSummary(V(), m, today());
     const b = FC.budgetFor(S.data, next);
     const recurringByCat = {};
     for (const r of S.data.recurring.filter((x) => x.active)) recurringByCat[r.categoryId] = (recurringByCat[r.categoryId] || 0) + r.amount;
@@ -952,28 +1071,224 @@
   /* ================= Paramètres ================= */
   function viewSettings() {
     const d = S.data;
-    return `<form class="card" data-form="profile" novalidate>
-        <h2>Profil</h2>
-        ${fields([
-          { name: 'name', label: 'Prénom', required: true },
-          { name: 'currency', label: 'Devise', type: 'select', options: [['EUR', 'Euro (€)'], ['CHF', 'Franc suisse (CHF)'], ['CAD', 'Dollar canadien ($ CA)'], ['USD', 'Dollar américain ($)'], ['XOF', 'Franc CFA (XOF)'], ['MAD', 'Dirham marocain (MAD)'], ['GBP', 'Livre sterling (£)']].map(([value, label]) => ({ value, label })) },
-          { name: 'amount', label: 'Salaire net par versement', type: 'money', required: true },
-          { name: 'frequency', label: 'Fréquence de versement', type: 'select', options: freqOptions() },
-          { name: 'day', label: 'Jour de versement', type: 'number', min: 1, max: 31 },
-        ], { name: d.profile.name, currency: d.profile.currency, ...d.profile.salary })}
-        <div class="actions"><button class="btn primary" type="submit">Enregistrer</button></div>
-      </form>
+    return `<a class="card link-card" href="#profil"><span class="avatar" aria-hidden="true">${esc(initials())}</span><span><strong>Mon compte</strong><small class="muted">Prénom, devise, salaire, identifiant, mot de passe, suppression du compte</small></span><span aria-hidden="true">›</span></a>
+      <a class="card link-card" href="#comptes"><span class="avatar bank" aria-hidden="true">▣</span><span><strong>Comptes bancaires</strong><small class="muted">${d.accounts.length} compte(s) · ajouter, renommer, archiver</small></span><span aria-hidden="true">›</span></a>
       <div class="card">
         <div class="card-head"><h2>Catégories de dépenses</h2><button class="btn" data-action="add-category">+ Catégorie</button></div>
         <ul class="cat-list">${d.categories.map((c) => `<li><span class="sw big" style="background:${c.color}"></span><span>${esc(c.name)}</span><span class="muted small">${d.expenses.filter((e) => e.categoryId === c.id).length} dépense(s)</span>
           <span class="row-actions"><button class="icon-btn" data-action="edit-category" data-id="${c.id}" aria-label="Modifier">✎</button><button class="icon-btn" data-action="del-category" data-id="${c.id}" aria-label="Supprimer">🗑</button></span></li>`).join('')}</ul>
       </div>
       <div class="card">
-        <h2>Compte</h2>
+        <h2>Données</h2>
         <p class="muted">Connecté en tant que <strong>${esc(S.user)}</strong>. ${Backend.settingsNote ? Backend.settingsNote(esc(S.user)) : Backend.online ? 'Les données sont enregistrées dans des fichiers CSV, dans le dossier <code>donnees/utilisateurs/' + esc(S.user) + '/</code> de Finance_Care. Elles sont rechargées à chaque lancement.' : 'Mode navigateur : les données sont enregistrées dans ce navigateur. Lancez Finance_Care avec le serveur pour les enregistrer en CSV.'}</p>
         <div class="actions left"><button class="btn" data-action="restart-onboarding">Relancer la configuration guidée</button><button class="btn" data-action="load-demo">Charger des données d'exemple</button><button class="btn ghost danger" data-action="reset-data">Effacer toutes mes données</button></div>
       </div>`;
   }
+  /* ================= Comptes bancaires ================= */
+  function viewBanks() {
+    const d = S.data, t = today(), m = FC.monthOf(t);
+    const total = FC.sum(d.accounts.filter((a) => !a.archived), (a) => FC.accountBalance(d, a.id, t));
+    const card = (a) => {
+      const bal = FC.accountBalance(d, a.id, t);
+      const inM = FC.sum(d.incomes.filter((i) => i.accountId === a.id && FC.monthOf(i.date) === m && i.date <= t), (i) => i.amount);
+      const outM = FC.sum(d.expenses.filter((e) => e.accountId === a.id && FC.monthOf(e.date) === m && e.date <= t), (e) => e.amount);
+      const nOps = d.incomes.filter((i) => i.accountId === a.id).length + d.expenses.filter((e) => e.accountId === a.id).length;
+      const isSal = d.profile.salary.accountId === a.id;
+      return `<div class="card bank-card ${a.archived ? 'archived' : ''}" style="--c:${esc(a.color)}">
+        <div class="row"><div><h3>${esc(a.name)}</h3><span class="tag">${esc(BANK_TYPES[a.type] || 'Autre')}</span>${isSal ? ' <span class="tag fixed">Reçoit le salaire</span>' : ''}${a.archived ? ' <span class="tag">Archivé</span>' : ''}</div>
+          <strong class="bank-bal ${bal < 0 ? 'neg' : ''}">${money(bal)}</strong></div>
+        <div class="row small muted bank-flows"><span>Ce mois : +${money(inM)} / −${money(outM)}</span><span>${nOps} opération(s)</span></div>
+        <div class="actions left">
+          ${a.archived ? '' : `<button class="btn small" data-action="only-bank" data-id="${esc(a.id)}">Voir uniquement ce compte</button>`}
+          <button class="btn ghost small" data-action="edit-bank" data-id="${esc(a.id)}">Modifier</button>
+          <button class="btn ghost small" data-action="archive-bank" data-id="${esc(a.id)}">${a.archived ? 'Réactiver' : 'Archiver'}</button>
+          ${d.accounts.length > 1 ? `<button class="btn ghost small danger" data-action="del-bank" data-id="${esc(a.id)}">Supprimer</button>` : ''}
+        </div>
+      </div>`;
+    };
+    return `<div class="kpis">
+        ${kpi('Solde total', money(total), d.accounts.filter((a) => !a.archived).length + ' compte(s) actif(s)', total < 0 ? 'neg' : 'hero')}
+      </div>
+      <div class="card-head page-head"><h2>Mes comptes</h2><button class="btn primary" data-action="add-bank">+ Nouveau compte</button></div>
+      <p class="muted small">Le solde = solde de départ + revenus − dépenses enregistrés sur le compte jusqu'à aujourd'hui. En haut des pages Tableau de bord, Revenus, Dépenses, Budget et Historique, touchez un ou plusieurs comptes pour n'afficher que leurs chiffres.</p>
+      <div class="banks">${d.accounts.map(card).join('')}</div>`;
+  }
+  function bankForm(a) {
+    const used = new Set(S.data.accounts.map((x) => x.color));
+    const v = a || { name: '', type: 'courant', color: BANK_COLORS.find((c) => !used.has(c)) || BANK_COLORS[0], initialBalance: '' };
+    openModal(a ? 'Modifier le compte' : 'Nouveau compte bancaire', fields([
+      { name: 'name', label: 'Nom du compte', required: true, placeholder: 'ex. Compte courant, Livret A, Compte joint' },
+      { name: 'type', label: 'Type', type: 'select', options: Object.entries(BANK_TYPES).map(([value, label]) => ({ value, label })) },
+      { name: 'initialBalance', label: 'Solde de départ', type: 'money', min: -1e9, help: 'Le solde du compte avant les opérations enregistrées dans Finance_Care.' },
+      { name: 'color', label: 'Couleur', type: 'color' },
+    ], v) + (S.data.accounts.length > 0 ? field({ name: 'salary', label: 'Mon salaire est versé sur ce compte', type: 'checkbox' }, a ? S.data.profile.salary.accountId === a.id : false) : ''),
+    (o, form) => {
+      if (!requireFields(form, ['name'])) return;
+      const name = o.name.trim();
+      if (S.data.accounts.some((x) => x !== a && x.name.toLowerCase() === name.toLowerCase())) return toast('Un compte porte déjà ce nom.', 'warning');
+      const rec = { name, type: o.type, color: o.color, initialBalance: FC.round2(num(o.initialBalance)) };
+      let target = a;
+      if (a) Object.assign(a, rec);
+      else {
+        let id = name.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'compte';
+        if (S.data.accounts.some((x) => x.id === id)) id += '-' + uid().slice(-4);
+        target = { id, archived: false, ...rec };
+        S.data.accounts.push(target);
+      }
+      if (o.salary) S.data.profile.salary.accountId = target.id;
+      save(); closeModal(); render();
+      toast(a ? 'Compte modifié.' : `Compte « ${esc(name)} » créé.`, 'good');
+    });
+  }
+  function deleteBankModal(a) {
+    const d = S.data;
+    const nOps = d.incomes.filter((i) => i.accountId === a.id).length + d.expenses.filter((e) => e.accountId === a.id).length + d.recurring.filter((r) => r.accountId === a.id).length;
+    const others = d.accounts.filter((x) => x.id !== a.id);
+    openModal(`Supprimer « ${a.name} » ?`, nOps
+      ? `<p>Ce compte contient <strong>${nOps} opération(s)</strong> (revenus, dépenses, récurrentes). Que faut-il en faire ?</p>
+        ${fields([{ name: 'move', label: 'Opérations', type: 'radio', options: [{ value: 'move', label: 'Les déplacer' }, { value: 'delete', label: 'Les supprimer' }] },
+          { name: 'to', label: 'Vers le compte', type: 'select', options: others.map((x) => ({ value: x.id, label: x.name })) }], { move: 'move', to: others[0].id })}
+        <p class="help">Astuce : « Archiver » cache le compte sans rien supprimer.</p>`
+      : '<p>Ce compte ne contient aucune opération.</p>',
+    (o) => {
+      const to = o.to || others[0].id;
+      for (const k of ['incomes', 'expenses', 'recurring']) {
+        if (o.move === 'delete') d[k] = d[k].filter((x) => x.accountId !== a.id);
+        else d[k].forEach((x) => { if (x.accountId === a.id) x.accountId = to; });
+      }
+      if (o.move === 'delete') d.expenses.forEach((e) => { if (e.recurringId && !d.recurring.some((r) => r.id === e.recurringId)) delete e.recurringId; });
+      if (d.profile.salary.accountId === a.id) d.profile.salary.accountId = to;
+      d.accounts = d.accounts.filter((x) => x.id !== a.id);
+      setSel(S.sel.filter((id) => id !== a.id));
+      save(); closeModal(); render();
+      toast(`Compte « ${esc(a.name)} » supprimé.`, 'good');
+    }, 'Supprimer le compte');
+  }
+
+  /* ================= Mon compte (profil, identifiants, suppression) ================= */
+  const CURRENCIES = [['EUR', 'Euro (€)'], ['CHF', 'Franc suisse (CHF)'], ['CAD', 'Dollar canadien ($ CA)'], ['USD', 'Dollar américain ($)'], ['XOF', 'Franc CFA (XOF)'], ['MAD', 'Dirham marocain (MAD)'], ['GBP', 'Livre sterling (£)']].map(([value, label]) => ({ value, label }));
+  function viewProfile() {
+    const d = S.data, acc = (Store.get('fc_accounts') || {})[S.user] || {};
+    return `<div class="profile-head card">
+        <span class="avatar big" aria-hidden="true">${esc(initials())}</span>
+        <div><h2>${esc(d.profile.name || S.user)}</h2><p class="muted small">Identifiant : <strong>${esc(S.user)}</strong>${acc.createdAt ? ' · compte créé le ' + dateFr(acc.createdAt) : ''}</p></div>
+      </div>
+      <form class="card" data-form="profile-info" novalidate>
+        <h2>Informations personnelles</h2>
+        ${fields([
+          { name: 'name', label: 'Prénom', required: true },
+          { name: 'currency', label: 'Devise', type: 'select', options: CURRENCIES },
+        ], { name: d.profile.name, currency: d.profile.currency })}
+        <div class="actions"><button class="btn primary" type="submit">Enregistrer</button></div>
+      </form>
+      <form class="card" data-form="profile-salary" novalidate>
+        <h2>Salaire</h2>
+        ${fields([
+          { name: 'amount', label: 'Salaire net par versement', type: 'money', required: true },
+          { name: 'frequency', label: 'Fréquence de versement', type: 'select', options: freqOptions() },
+          { name: 'day', label: 'Jour de versement', type: 'number', min: 1, max: 31 },
+          { name: 'accountId', label: 'Versé sur le compte', type: 'select', options: bankOptions(d.profile.salary.accountId) },
+        ], d.profile.salary)}
+        <div class="actions"><button class="btn primary" type="submit">Enregistrer</button></div>
+      </form>
+      <div class="grid2">
+        <form class="card" data-form="profile-username" novalidate>
+          <h2>Nom d'utilisateur</h2>
+          <p class="muted small">Sert à vous connecter. Vos données sont déplacées vers le nouveau nom.</p>
+          ${fields([
+            { name: 'username', label: "Nouveau nom d'utilisateur", required: true, help: 'Lettres minuscules sans accent, chiffres, « . », « _ » ou « - ».' },
+            { name: 'password', label: 'Mot de passe actuel', type: 'password', required: true },
+          ], { username: S.user })}
+          <div class="actions"><button class="btn primary" type="submit">Changer</button></div>
+        </form>
+        <form class="card" data-form="profile-password" novalidate>
+          <h2>Mot de passe</h2>
+          ${fields([
+            { name: 'current', label: 'Mot de passe actuel', type: 'password', required: true },
+            { name: 'password', label: 'Nouveau mot de passe', type: 'password', required: true, help: '6 caractères minimum' },
+            { name: 'password2', label: 'Confirmer le nouveau mot de passe', type: 'password', required: true },
+          ])}
+          <div class="actions"><button class="btn primary" type="submit">Changer le mot de passe</button></div>
+        </form>
+      </div>
+      <div class="card danger-zone">
+        <h2>Supprimer mon compte</h2>
+        <p class="muted">Supprime définitivement votre identifiant et <strong>toutes</strong> vos données (revenus, dépenses, budgets, objectifs, comptes bancaires)${Backend.online ? ', y compris les fichiers CSV' : ''}. Cette action est irréversible.</p>
+        <div class="actions left"><button class="btn danger-solid" data-action="delete-account">Supprimer mon compte…</button></div>
+      </div>
+      <div class="actions left m-only"><button class="btn block" data-action="logout">Se déconnecter</button></div>`;
+  }
+  async function checkPassword(pw) {
+    const acc = (Store.get('fc_accounts') || {})[S.user];
+    return !!acc && (await hashPassword(pw || '', acc.salt)) === acc.hash;
+  }
+  function deleteAccountModal() {
+    openModal('Supprimer mon compte', `<div class="alert critical"><span aria-hidden="true">✕</span><span><strong>Action irréversible.</strong> Toutes les données de <strong>${esc(S.user)}</strong> seront effacées${Backend.online ? ' (fichiers CSV compris)' : ''}.</span></div>
+      <p class="muted small">Pour confirmer, tapez votre nom d'utilisateur et votre mot de passe.</p>
+      ${fields([
+        { name: 'confirmUser', label: `Tapez « ${S.user} »`, required: true },
+        { name: 'password', label: 'Mot de passe', type: 'password', required: true },
+      ])}`, async (o, form) => {
+      if (!requireFields(form, ['confirmUser', 'password'])) return;
+      if (o.confirmUser.trim().toLowerCase() !== S.user) return toast("Le nom d'utilisateur ne correspond pas.", 'warning');
+      if (!(await checkPassword(o.password))) return toast('Mot de passe incorrect.', 'warning');
+      const u = S.user;
+      try { await Store.remove(dataKey(u)); }
+      catch (e) { return toast('Suppression impossible : ' + esc(e.message) + '. Rien n\'a été supprimé de votre identifiant.', 'critical', 8000); }
+      const accounts = Store.get('fc_accounts') || {};
+      delete accounts[u];
+      Store.set('fc_accounts', accounts);
+      Store.del('fc_sel_' + u);
+      closeModal(); logout();
+      toast('Votre compte et vos données ont été supprimés.', 'good', 6000);
+    }, 'Supprimer définitivement');
+    const btn = document.querySelector('#modal-root button[type=submit]'); if (btn) btn.classList.add('danger-solid');
+  }
+  async function changeUsername(o, form) {
+    if (!requireFields(form, ['username', 'password'])) return;
+    const nu = o.username.trim().toLowerCase(), old = S.user;
+    if (nu === old) return toast("C'est déjà votre nom d'utilisateur.", 'info');
+    if (!/^[a-z0-9._-]{1,40}$/.test(nu) || /^\.+$/.test(nu)) return toast("Le nom d'utilisateur ne peut contenir que des lettres minuscules sans accent, des chiffres, « . », « _ » ou « - ».", 'warning');
+    const accounts = Store.get('fc_accounts') || {};
+    if (accounts[nu]) return toast("Ce nom d'utilisateur existe déjà.", 'warning');
+    if (!(await checkPassword(o.password))) return toast('Mot de passe incorrect.', 'warning');
+    const remembered = Store.get('fc_remember') === old;
+    // 1) copie des données sous le nouveau nom, 2) identifiants, 3) suppression de l'ancien dossier
+    Store.set(dataKey(nu), S.data);
+    accounts[nu] = accounts[old]; delete accounts[old];
+    Store.set('fc_accounts', accounts);
+    Store.set('fc_sel_' + nu, S.sel); Store.del('fc_sel_' + old);
+    S.user = nu; Session.set(nu, remembered);
+    try { await Store.remove(dataKey(old)); }
+    catch (e) { toast("Nom changé, mais l'ancien dossier n'a pas pu être supprimé (" + esc(e.message) + ').', 'warning', 8000); }
+    render(); toast(`Nom d'utilisateur changé : ${esc(nu)}.`, 'good');
+  }
+  async function changePassword(o, form) {
+    if (!requireFields(form, ['current', 'password', 'password2'])) return;
+    if (!(await checkPassword(o.current))) return toast('Mot de passe actuel incorrect.', 'warning');
+    if (o.password.length < 6) return toast('Le mot de passe doit contenir au moins 6 caractères.', 'warning');
+    if (o.password !== o.password2) return toast('Les mots de passe ne correspondent pas.', 'warning');
+    const accounts = Store.get('fc_accounts') || {};
+    const salt = uid();
+    accounts[S.user] = { ...accounts[S.user], salt, hash: await hashPassword(o.password, salt) };
+    Store.set('fc_accounts', accounts);
+    form.reset(); toast('Mot de passe modifié.', 'good');
+  }
+  /* Feuilles du téléphone : « + » et « Plus » */
+  function quickAddSheet() {
+    openModal('Ajouter', `<div class="sheet-grid">
+      <button type="button" class="sheet-btn" data-action="add-expense"><span class="op-ic" style="background:var(--critical)">↑</span>Dépense</button>
+      <button type="button" class="sheet-btn" data-action="add-income"><span class="op-ic" style="background:var(--good)">↓</span>Revenu</button>
+      <button type="button" class="sheet-btn" data-action="add-recurring"><span class="op-ic" style="background:var(--accent)">↻</span>Dépense récurrente</button>
+      <button type="button" class="sheet-btn" data-action="add-bank"><span class="op-ic" style="background:#5b6b7f">▣</span>Compte bancaire</button>
+    </div>`, null, '', { cancelLabel: 'Fermer' });
+  }
+  function moreSheet() {
+    const items = NAV.filter(([k]) => !TABS.some((x) => x && x[0] === k));
+    openModal('Menu', `<nav class="sheet-list">${items.map(([k, l, i]) => `<a href="#${k}" data-action="close-modal" class="${S.route === k ? 'active' : ''}"><span aria-hidden="true">${i}</span>${l}<b aria-hidden="true">›</b></a>`).join('')}
+      <button type="button" data-action="logout"><span aria-hidden="true">⎋</span>Se déconnecter</button></nav>`, null, '', { cancelLabel: 'Fermer' });
+  }
+
   function categoryForm(c) {
     const used = new Set(S.data.categories.map((x) => x.color));
     const nextColor = FC.PALETTE.find((p) => !used.has(p)) || '#8d8d8d';
@@ -997,22 +1312,27 @@
     const d = S.data, t = today(), cur = FC.monthOf(t);
     d.profile.salary = { amount: 2400, frequency: 'mensuel', day: 1 };
     d.incomes = []; d.expenses = []; d.recurring = []; d.goals = []; d.budgets = {};
+    d.accounts = [{ id: 'principal', name: 'Compte courant', type: 'courant', color: '#1b64be', initialBalance: 850, archived: false },
+      { id: 'livret-a', name: 'Livret A', type: 'livret', color: '#00a37a', initialBalance: 3200, archived: false },
+      { id: 'compte-joint', name: 'Compte joint', type: 'joint', color: '#e0702a', initialBalance: 420, archived: false }];
+    d.profile.salary.accountId = 'principal'; setSel([]);
     const start = FC.addMonths(cur, -4);
     d.budgets[start] = { global: 1700, categories: { alimentation: 400, logement: 750, transport: 150, loisirs: 150, sante: 60, abonnements: 40, assurances: 60, autres: 90 } };
-    d.recurring.push({ id: uid(), label: 'Loyer', amount: 750, categoryId: 'logement', day: 5, startMonth: start, endMonth: '', active: true, skipped: [] });
-    d.recurring.push({ id: uid(), label: 'Abonnement streaming + téléphone', amount: 32.99, categoryId: 'abonnements', day: 12, startMonth: start, endMonth: '', active: true, skipped: [] });
-    d.recurring.push({ id: uid(), label: 'Assurance habitation', amount: 18.5, categoryId: 'assurances', day: 20, startMonth: start, endMonth: '', active: true, skipped: [] });
+    d.recurring.push({ id: uid(), label: 'Loyer', amount: 750, categoryId: 'logement', day: 5, startMonth: start, endMonth: '', active: true, skipped: [], accountId: 'principal' });
+    d.recurring.push({ id: uid(), label: 'Abonnement streaming + téléphone', amount: 32.99, categoryId: 'abonnements', day: 12, startMonth: start, endMonth: '', active: true, skipped: [], accountId: 'principal' });
+    d.recurring.push({ id: uid(), label: 'Assurance habitation', amount: 18.5, categoryId: 'assurances', day: 20, startMonth: start, endMonth: '', active: true, skipped: [], accountId: 'compte-joint' });
     let seed = 7; const rnd = () => (seed = (seed * 9301 + 49297) % 233280) / 233280;
     const goalV = { id: uid(), name: 'Vacances d\'été', type: 'vacances', target: 1500, deadline: FC.addMonths(cur, 7) + '-01', createdAt: start + '-01', percent: 8, contributions: [] };
     const goalU = { id: uid(), name: "Fonds d'urgence", type: 'urgence', target: 5000, deadline: FC.addMonths(cur, 20) + '-01', createdAt: start + '-01', percent: 7, contributions: [{ id: uid(), date: start + '-01', amount: 1200, note: 'Épargne initiale' }] };
     d.goals.push(goalV, goalU);
     for (const m of FC.monthRange(start, cur)) {
       const last = m === cur ? Number(t.slice(8, 10)) : FC.daysInMonth(m);
-      d.incomes.push({ id: uid(), date: m + '-01', amount: 2400, type: 'salaire', label: 'Salaire' });
-      if (rnd() > 0.5 && last > 15) d.incomes.push({ id: uid(), date: m + '-15', amount: Math.round(100 + rnd() * 250), type: 'supplementaire', label: 'Mission freelance' });
+      d.incomes.push({ id: uid(), date: m + '-01', amount: 2400, type: 'salaire', label: 'Salaire', accountId: 'principal' });
+      if (rnd() > 0.5 && last > 15) d.incomes.push({ id: uid(), date: m + '-15', amount: Math.round(100 + rnd() * 250), type: 'supplementaire', label: 'Mission freelance', accountId: 'principal' });
+      if (last > 2) d.incomes.push({ id: uid(), date: m + '-02', amount: 300, type: 'supplementaire', label: 'Participation commune', accountId: 'compte-joint' });
       goalV.contributions.push({ id: uid(), date: m + '-01', amount: 192, note: 'Épargne sur salaire' });
       goalU.contributions.push({ id: uid(), date: m + '-01', amount: 168, note: 'Épargne sur salaire' });
-      const add = (day, amount, categoryId, label) => { if (day <= last) d.expenses.push({ id: uid(), date: m + '-' + String(day).padStart(2, '0'), amount: FC.round2(amount), categoryId, kind: 'variable', label }); };
+      const add = (day, amount, categoryId, label) => { if (day <= last) d.expenses.push({ id: uid(), date: m + '-' + String(day).padStart(2, '0'), amount: FC.round2(amount), categoryId, kind: 'variable', label, accountId: categoryId === 'alimentation' ? 'compte-joint' : 'principal' }); };
       for (let w = 0; w < 4; w++) add(3 + w * 7, 70 + rnd() * 45, 'alimentation', 'Courses');
       add(8, 40 + rnd() * 30, 'transport', 'Carburant'); add(22, 35 + rnd() * 40, 'transport', 'Carburant');
       add(10, 25 + rnd() * 60, 'loisirs', 'Cinéma / sorties'); add(24, 30 + rnd() * 90, 'loisirs', 'Restaurant');
@@ -1028,22 +1348,37 @@
   const find = (arr, id) => arr.find((x) => x.id === id);
   const actions = {
     'auth-mode': (ds) => renderAuth(ds.mode),
-    logout,
+    logout: () => { closeModal(); logout(); },
     'close-modal': closeModal,
     month: (ds) => { S.month = FC.addMonths(S.month, Number(ds.delta)); render(); },
     'month-today': () => { S.month = FC.monthOf(today()); render(); },
     'goto-month': (ds, el, e) => { e.preventDefault(); S.month = ds.month; render(); window.scrollTo(0, 0); },
-    'add-income': () => incomeForm(),
+    'add-income': () => { closeModal(); incomeForm(); },
+    'sel-all': () => { setSel([]); render(); },
+    'sel-bank': (ds) => { const cur = S.sel.slice(); const i = cur.indexOf(ds.id); if (i >= 0) cur.splice(i, 1); else cur.push(ds.id); setSel(cur); render(); },
+    'only-bank': (ds) => { setSel([ds.id]); location.hash = 'tableau'; },
+    'add-bank': () => { closeModal(); bankForm(); },
+    'edit-bank': (ds) => bankForm(find(S.data.accounts, ds.id)),
+    'archive-bank': (ds) => {
+      const a = find(S.data.accounts, ds.id);
+      if (!a.archived && activeBanks().length <= 1) return toast('Gardez au moins un compte actif.', 'warning');
+      a.archived = !a.archived; if (a.archived) setSel(S.sel.filter((id) => id !== a.id));
+      save(); render(); toast(a.archived ? 'Compte archivé : il n\'apparaît plus dans les choix, ses opérations sont conservées.' : 'Compte réactivé.', 'good');
+    },
+    'del-bank': (ds) => deleteBankModal(find(S.data.accounts, ds.id)),
+    'delete-account': deleteAccountModal,
+    'quick-add': quickAddSheet,
+    'more-menu': moreSheet,
     'edit-income': (ds) => incomeForm(find(S.data.incomes, ds.id)),
     'del-income': (ds) => confirmModal('Supprimer ce revenu ?', () => { S.data.incomes = S.data.incomes.filter((i) => i.id !== ds.id); }),
-    'add-expense': () => expenseForm(),
+    'add-expense': () => { closeModal(); expenseForm(); },
     'edit-expense': (ds) => expenseForm(find(S.data.expenses, ds.id)),
     'del-expense': (ds) => confirmModal('Supprimer cette dépense ?', () => {
       const e = find(S.data.expenses, ds.id);
       if (e && e.recurringId) { const r = find(S.data.recurring, e.recurringId); if (r) { r.skipped = r.skipped || []; r.skipped.push(FC.monthOf(e.date)); } }
       S.data.expenses = S.data.expenses.filter((x) => x.id !== ds.id);
     }),
-    'add-recurring': () => recurringForm(),
+    'add-recurring': () => { closeModal(); recurringForm(); },
     'edit-recurring': (ds) => recurringForm(find(S.data.recurring, ds.id)),
     'toggle-recurring': (ds) => { const r = find(S.data.recurring, ds.id); r.active = !r.active; if (r.active) FC.applyRecurring(S.data, today(), uid); save(); render(); },
     'del-recurring': (ds) => confirmModal('Supprimer cette dépense récurrente ? Les dépenses déjà enregistrées sont conservées.', () => {
@@ -1082,7 +1417,7 @@
     'restart-onboarding': () => { S.data.onboarded = false; S.onboardStep = 0; save(); render(); },
     'load-demo': () => confirmModal("Remplacer toutes vos données par des données d'exemple ?", loadDemo, true),
     'reset-data': () => confirmModal('Effacer définitivement toutes vos données financières ?', () => {
-      const name = S.data.profile.name; S.data = newData(name); S.onboardStep = 0;
+      const name = S.data.profile.name; S.data = newData(name); S.onboardStep = 0; setSel([]);
     }),
     'onb-step': (ds) => { S.onboardStep = Number(ds.step); render(); },
     'onb-goals-done': () => { S.onboardStep = 3; render(); },
@@ -1115,12 +1450,18 @@
       S.data.goals.forEach((g) => { if (o['p_' + g.id] !== undefined) g.percent = Math.max(0, Math.min(100, num(o['p_' + g.id]))); });
       save(); render(); toast('Pourcentages enregistrés.', 'good');
     },
-    profile: (o, form) => {
-      if (!requireFields(form, ['name', 'amount'])) return;
+    'profile-info': (o, form) => {
+      if (!requireFields(form, ['name'])) return;
       S.data.profile.name = o.name.trim(); S.data.profile.currency = o.currency;
-      S.data.profile.salary = { amount: FC.round2(num(o.amount)), frequency: o.frequency, day: Math.min(31, Math.max(1, parseInt(o.day, 10) || 1)) };
-      save(); render(); toast('Profil enregistré.', 'good');
+      save(); render(); toast('Informations enregistrées.', 'good');
     },
+    'profile-salary': (o, form) => {
+      if (!requireFields(form, ['amount'])) return;
+      S.data.profile.salary = { amount: FC.round2(num(o.amount)), frequency: o.frequency, day: Math.min(31, Math.max(1, parseInt(o.day, 10) || 1)), accountId: o.accountId || defaultBankId() };
+      save(); render(); toast("Salaire enregistré : les montants d'épargne ont été recalculés.", 'good');
+    },
+    'profile-username': changeUsername,
+    'profile-password': changePassword,
   };
 
   document.addEventListener('click', (e) => {
@@ -1153,7 +1494,7 @@
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && document.getElementById('modal-root').classList.contains('open')) closeModal(); });
   window.addEventListener('hashchange', () => {
     const r = location.hash.slice(1);
-    if (S.user && S.data && S.data.onboarded && r && r !== S.route) { S.route = r; render(); window.scrollTo(0, 0); }
+    if (S.user && S.data && S.data.onboarded && r && r !== S.route) { closeModal(); S.route = r; render(); window.scrollTo(0, 0); }
   });
 
   /* ================= Démarrage ================= */
@@ -1161,8 +1502,10 @@
     await Backend.init();
     const u = Session.get();
     if (u) await Backend.loadUser(u);
-    if (u && Store.get(dataKey(u))) await login(u, false); else renderAuth('login');
-    if (!Backend.online) setTimeout(() => toast("Mode navigateur : lancez Finance_Care avec « lancer » pour enregistrer vos données dans des fichiers CSV.", 'warning', 9000), 400);
+    // Un compte supprimé (par exemple depuis l'autre appareil) ne se reconnecte pas automatiquement.
+    if (u && Store.get(dataKey(u)) && (Store.get('fc_accounts') || {})[u]) await login(u, false);
+    else { if (u) Session.clear(); renderAuth('login'); }
+    if (!Backend.online && !Backend.quiet) setTimeout(() => toast("Mode navigateur : lancez Finance_Care avec « lancer » pour enregistrer vos données dans des fichiers CSV.", 'warning', 9000), 400);
   })();
 
   // Mise à jour automatique (dépenses récurrentes) si l'application reste ouverte au changement de jour
