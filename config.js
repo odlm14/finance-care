@@ -6,5 +6,5 @@
  */
 window.FC_CONFIG = {
   provider: 'dropbox',
-  clientId: '',
+  clientId: 'vtq049s5wgklstc',
 };
